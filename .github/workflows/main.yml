@@ -1,0 +1,142 @@
+name: Generate SUSFS Patches
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  generate-patches:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Set up Git identity
+      run: |
+        git config --global user.name "bromanprjkt"
+        git config --global user.email "emanpedia@yahoo.com"
+
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up environment
+      run: |
+        mkdir -p generated-patches
+        echo "## SUSFS Patches for All Supported Branches" > release_body.md
+        echo "" >> release_body.md
+        echo "**Generated at:** $(date)" >> release_body.md
+        echo "" >> release_body.md
+
+    - name: Generate patches for all branches
+
+      id: generate-patches
+
+      run: |
+        declare -A branch_configs=(
+          ["gki-android12-5.10"]="android12-5.10-lts 5.10 12"
+          ["gki-android13-5.10"]="android13-5.10-lts 5.10 13"
+          ["gki-android13-5.15"]="android13-5.15-lts 5.15 13"
+          ["gki-android14-5.15"]="android14-5.15-lts 5.15 14"
+          ["gki-android14-6.1"]="android14-6.1-lts 6.1 14"
+          ["gki-android15-6.6"]="android15-6.6-lts 6.6 15"
+        )
+
+        branch_order=(
+          "gki-android12-5.10"
+          "gki-android13-5.10"
+          "gki-android13-5.15"
+          "gki-android14-5.15"
+          "gki-android14-6.1"
+          "gki-android15-6.6"
+        )
+
+        SUSFS_VERSION=""
+        SUSFS_COMMIT_HASH=""
+        
+        for susfs_branch in "${branch_order[@]}"; do
+          IFS=' ' read -r kernel_branch kernel_version android_version <<< "${branch_configs[$susfs_branch]}"
+          
+          echo "Processing: $susfs_branch -> $kernel_branch"
+          
+          # Clone SUSFS source
+          git clone --depth 1 -b "$susfs_branch" https://github.com/ShirkNeko/susfs4ksu.git "susfs-$susfs_branch"
+          
+          # Get SUSFS version (only once)
+          if [ -z "$SUSFS_VERSION" ]; then
+            SUSFS_VERSION=$(grep -oP '#define SUSFS_VERSION "\K[^"]+' "susfs-$susfs_branch/kernel_patches/include/linux/susfs.h")
+            SUSFS_COMMIT_HASH=$(git -C "susfs-$susfs_branch" rev-parse --short HEAD)
+            echo "SUSFS_VERSION=${SUSFS_VERSION}" >> $GITHUB_OUTPUT
+            echo "SUSFS_COMMIT_HASH=${SUSFS_COMMIT_HASH}" >> $GITHUB_OUTPUT
+            echo "tag_name=${SUSFS_VERSION}-${SUSFS_COMMIT_HASH}" >> $GITHUB_OUTPUT
+          fi
+          
+          # Clone kernel source
+          git clone --depth 1 -b "$kernel_branch" https://android.googlesource.com/kernel/common "kernel-$kernel_branch"
+          
+          # Generate patches
+          pushd "kernel-$kernel_branch"
+          git checkout -b susfs-patched
+          
+          # Copy everything EXCEPT KernelSU/
+          if [ -d "../susfs-$susfs_branch/kernel_patches" ]; then
+            rsync -av --exclude='KernelSU/' "../susfs-$susfs_branch/kernel_patches/" .
+          fi
+          
+          # Apply the additional patch
+          PATCH_FILE="../susfs-$susfs_branch/kernel_patches/50_add_susfs_in_$susfs_branch.patch"
+          if [ -f "$PATCH_FILE" ]; then
+            echo "Applying patch..."
+            git apply --whitespace=fix "$PATCH_FILE"
+          else
+            echo "Patch file not found: $PATCH_FILE"
+            exit 1
+          fi
+          
+          # Generate patches
+          git add -A
+          if ! git diff --staged --quiet; then
+            git commit -m "Implement SUSFS $SUSFS_VERSION for Android $android_version (Kernel $kernel_version)"
+            mkdir -p "../generated-patches/$susfs_branch"
+            git format-patch "$kernel_branch" --output-directory "../generated-patches/$susfs_branch/"
+            
+            # Add to release body
+            echo "### Android $android_version (Kernel $kernel_version)" >> ../release_body.md
+            echo "- SUSFS Branch: \`$susfs_branch\`" >> ../release_body.md
+            echo "- Kernel Branch: \`$kernel_branch\`" >> ../release_body.md
+            echo "- Patch Files:" >> ../release_body.md
+            for patch in $(ls "../generated-patches/$susfs_branch/"*.patch); do
+              echo "  - \`$(basename $patch)\`" >> ../release_body.md
+            done
+            echo "" >> ../release_body.md
+          else
+            echo "No changes detected for $susfs_branch!"
+            exit 1
+          fi
+          popd
+        done
+
+    - name: Prepare release
+      run: |
+        # Add instructions to release body
+        echo "" >> release_body.md
+        echo "### How to Apply" >> release_body.md
+        echo "Choose the appropriate directory for your Android/Kernel version and apply patches with:" >> release_body.md
+        echo '```sh' >> release_body.md
+        echo "git apply *.patch" >> release_body.md
+        echo '```' >> release_body.md
+
+    - name: List generated patches (debug)
+      run: |
+        find generated-patches -type f -name "*.patch" | xargs ls -la
+
+    - name: Create release with all patch files
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: ${{ steps.generate-patches.outputs.tag_name }}
+        name: "SUSFS Patches ${{ steps.generate-patches.outputs.tag_name }}"
+        body_path: release_body.md
+        files: |
+          generated-patches/**/*.patch
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
